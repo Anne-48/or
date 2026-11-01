@@ -1,0 +1,88 @@
+name: oracle-retry
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: oracle-retry
+  cancel-in-progress: false
+
+permissions:
+  actions: write   # para desativar sozinho quando der certo
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+      STACK_ID: ${{ secrets.STACK_ID }}
+    steps:
+      - name: Instalar OCI CLI
+        run: pip install --quiet oci-cli
+
+      - name: Configurar credenciais
+        env:
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.oci
+          printf '%s\n' "$OCI_PRIVATE_KEY" > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${{ secrets.OCI_USER_OCID }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_TENANCY_OCID }}
+          region=${{ secrets.OCI_REGION }}
+          key_file=~/.oci/key.pem
+          EOF
+          chmod 600 ~/.oci/config
+
+      - name: Tentar criar VMs
+        id: apply
+        run: |
+          job_id=$(oci resource-manager job create-apply-job \
+            --stack-id "$STACK_ID" \
+            --execution-plan-strategy AUTO_APPROVED \
+            --query 'data.id' --raw-output 2>err.log) || true
+
+          if [ -z "$job_id" ]; then
+            if grep -Eiq "NotAuthorized|NotAuthenticated|InvalidParameter|NotFound" err.log; then
+              echo "Erro permanente de credencial/configuração."
+              cat err.log
+              exit 1
+            fi
+            echo "Erro temporário (429, job em andamento etc.). Tenta na próxima."
+            exit 0
+          fi
+
+          state=$(oci resource-manager job get --job-id "$job_id" \
+            --wait-for-state SUCCEEDED --wait-for-state FAILED --wait-for-state CANCELED \
+            --max-wait-seconds 900 \
+            --query 'data."lifecycle-state"' --raw-output)
+          echo "Resultado: $state"
+
+          if [ "$state" = "SUCCEEDED" ]; then
+            echo "VMs criadas!"
+            echo "done=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          logs=$(oci resource-manager job get-job-logs-content --job-id "$job_id" \
+            --query 'data' --raw-output)
+          if echo "$logs" | grep -q "Out of host capacity"; then
+            echo "Sem capacidade. Tenta na próxima."
+            exit 0
+          fi
+
+          echo "$logs" | grep -i "error" | tail -20
+          echo "Falha diferente de capacidade. Verifique o job no console."
+          exit 1
+
+      - name: Desativar workflow (VMs criadas)
+        if: steps.apply.outputs.done == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow disable oracle-retry --repo "${{ github.repository }}"
