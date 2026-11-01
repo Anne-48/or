@@ -1,9 +1,7 @@
 name: oracle-retry
 
 on:
-  schedule:
-     - cron: "5,15,25,35,45,55 * * * *"
-  workflow_dispatch:
+  workflow_dispatch:   # disparado a cada 10 min pelo cron-job.org
 
 concurrency:
   group: oracle-retry
